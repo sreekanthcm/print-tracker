@@ -29,7 +29,7 @@ python -m PyInstaller --onefile --noconsole --name PrintTracker --icon icon.ico 
 
 The executable is created at `dist\PrintTracker.exe`. The icon is bundled for both the executable and the tray menu.
 
-Pushing a version tag such as `v1.0.0` runs the Windows release workflow. Until a trusted code-signing provider approves and signs the release, the generated executable is unsigned and may show Windows security warnings.
+Pushing a version tag such as `v1.0.0` runs the Windows release workflow. GitHub Releases are created only after the executable has been signed; before signing is configured, builds remain unsigned Actions artifacts and should not be treated as trusted releases.
 
 ## Code signing
 
