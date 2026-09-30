@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -27,14 +28,33 @@ jobs:
       - name: Build executable
         run: python -m PyInstaller --noconfirm --clean --onefile --noconsole --name PrintTracker --icon icon.ico --add-data "icon.ico;." --distpath dist print_tracker.py
 
-      - name: Upload build artifact
+      - name: Upload unsigned build artifact
+        id: upload-unsigned
         uses: actions/upload-artifact@v4
         with:
-          name: PrintTracker-windows
+          name: PrintTracker-unsigned
           path: dist/PrintTracker.exe
 
-      - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Request Authenticode signature
+        if: startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_PROJECT_SLUG != ''
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Publish signed GitHub release
+        if: startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_PROJECT_SLUG != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          files: signed/PrintTracker.exe
+
+      - name: Publish unsigned GitHub release
+        if: startsWith(github.ref, 'refs/tags/') && vars.SIGNPATH_PROJECT_SLUG == ''
         uses: softprops/action-gh-release@v2
         with:
           files: dist/PrintTracker.exe
