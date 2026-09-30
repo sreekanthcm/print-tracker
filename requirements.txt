@@ -1,0 +1,5 @@
+mysql-connector-python
+Pillow
+pystray
+pywin32
+pyinstaller
