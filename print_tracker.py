@@ -1,17 +1,22 @@
 import base64
 import datetime
+import hashlib
+import hmac
 import json
 import os
+import queue
+import secrets
 import socket
 import sys
 import threading
 import tkinter as tk
 import winreg
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import mysql.connector
 import pystray
+from pynput import keyboard, mouse
 import win32api
 import win32crypt
 import win32event
@@ -22,9 +27,13 @@ from mysql.connector import Error
 
 
 APP_NAME = "Print Tracker"
+ADMIN_PASSWORD_ITERATIONS = 600_000
+ACTIVITY_INTERVALS = (10, 20, 30, 40, 50, 60)
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "PrintTracker"
 CONFIG_FILE = APP_DIR / "config.json"
 QUEUE_FILE = APP_DIR / "queue.json"
+ACTIVITY_FILE = APP_DIR / "activity_log.jsonl"
+ACTIVITY_QUEUE_FILE = APP_DIR / "activity_queue.json"
 LOG_FILE = APP_DIR / "print_tracker.log"
 ICON_FILE = Path(__file__).resolve().with_name("icon.ico")
 STARTUP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -33,8 +42,11 @@ DEFAULT_CONFIG = {
     "host": "",
     "user": "",
     "password": "",
+    "admin_password_salt": "",
+    "admin_password_hash": "",
     "database": "print_tracking_db",
     "port": 3306,
+    "activity_interval_minutes": 10,
 }
 
 
@@ -43,7 +55,23 @@ def load_config():
     try:
         with CONFIG_FILE.open("r", encoding="utf-8") as config_file:
             saved = json.load(config_file)
-        config.update({key: saved[key] for key in ("host", "user", "database", "port") if key in saved})
+        config.update(
+            {
+                key: saved[key]
+                for key in (
+                    "host",
+                    "user",
+                    "database",
+                    "port",
+                    "activity_interval_minutes",
+                    "admin_password_salt",
+                    "admin_password_hash",
+                )
+                if key in saved
+            }
+        )
+        if config["activity_interval_minutes"] not in ACTIVITY_INTERVALS:
+            config["activity_interval_minutes"] = 10
         encrypted_password = saved.get("password_dpapi")
         if encrypted_password:
             encrypted_bytes = base64.b64decode(encrypted_password)
@@ -82,6 +110,12 @@ def write_log(message):
         log_file.write(f"{datetime.datetime.now().isoformat()} {message}\n")
 
 
+def activity_period_start(moment, interval_minutes):
+    interval_seconds = interval_minutes * 60
+    period_timestamp = int(moment.timestamp()) // interval_seconds * interval_seconds
+    return datetime.datetime.fromtimestamp(period_timestamp)
+
+
 class PrintTrackerApp:
     def __init__(self, root):
         APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -94,7 +128,13 @@ class PrintTrackerApp:
         self.status_lock = threading.Lock()
         self.status = "Starting"
         self.stop_event = threading.Event()
+        self.ui_commands = queue.Queue()
         self.config_window = None
+        self.activity_lock = threading.Lock()
+        self.activity_interval_minutes = self.config["activity_interval_minutes"]
+        self.activity_counts = {}
+        self.activity_listeners = []
+        self.initialize_activity_queue()
 
         menu = pystray.Menu(
             pystray.MenuItem("Configure database...", self.open_config_from_tray),
@@ -131,6 +171,9 @@ class PrintTrackerApp:
             "user": config["user"],
             "database": config["database"],
             "port": config["port"],
+            "activity_interval_minutes": config["activity_interval_minutes"],
+            "admin_password_salt": config["admin_password_salt"],
+            "admin_password_hash": config["admin_password_hash"],
             "password_dpapi": base64.b64encode(protected_password).decode("ascii"),
         }
         temporary_file = CONFIG_FILE.with_suffix(".tmp")
@@ -141,10 +184,93 @@ class PrintTrackerApp:
             self.config = config.copy()
 
     def open_config_from_tray(self, icon, item):
-        self.root.after(0, self.show_config)
+        self.ui_commands.put("configure_database")
+
+    def process_ui_commands(self):
+        while True:
+            try:
+                command = self.ui_commands.get_nowait()
+            except queue.Empty:
+                break
+            if command in ("configure_database", "open_data_folder"):
+                self.authorize_tray_action(command)
+
+        if not self.stop_event.is_set():
+            self.root.after(50, self.process_ui_commands)
 
     def open_data_folder_from_tray(self, icon, item):
-        os.startfile(str(APP_DIR))
+        self.ui_commands.put("open_data_folder")
+
+    def authorize_tray_action(self, action):
+        config = self.get_config()
+        password_salt = config["admin_password_salt"]
+        password_hash = config["admin_password_hash"]
+
+        if not password_salt or not password_hash:
+            password = simpledialog.askstring(
+                "Set admin password",
+                "Create an admin password of at least 8 characters:",
+                show="*",
+                parent=self.root,
+            )
+            if password is None:
+                return
+            if len(password) < 8:
+                messagebox.showerror(
+                    "Invalid password",
+                    "The admin password must be at least 8 characters.",
+                    parent=self.root,
+                )
+                return
+            confirmation = simpledialog.askstring(
+                "Confirm admin password",
+                "Enter the admin password again:",
+                show="*",
+                parent=self.root,
+            )
+            if confirmation is None:
+                return
+            if password != confirmation:
+                messagebox.showerror("Password mismatch", "The passwords do not match.", parent=self.root)
+                return
+
+            password_salt = secrets.token_bytes(16).hex()
+            password_hash = hashlib.pbkdf2_hmac(
+                "sha256",
+                password.encode("utf-8"),
+                bytes.fromhex(password_salt),
+                ADMIN_PASSWORD_ITERATIONS,
+            ).hex()
+            config["admin_password_salt"] = password_salt
+            config["admin_password_hash"] = password_hash
+            try:
+                self.save_config(config)
+            except Exception as error:
+                messagebox.showerror("Could not save admin password", str(error), parent=self.root)
+                return
+        else:
+            password = simpledialog.askstring(
+                "Admin password",
+                "Enter the admin password:",
+                show="*",
+                parent=self.root,
+            )
+            if password is None:
+                return
+            entered_hash = hashlib.pbkdf2_hmac(
+                "sha256",
+                password.encode("utf-8"),
+                bytes.fromhex(password_salt),
+                ADMIN_PASSWORD_ITERATIONS,
+            ).hex()
+            if not hmac.compare_digest(entered_hash, password_hash):
+                messagebox.showerror("Access denied", "The admin password is incorrect.", parent=self.root)
+                return
+
+        if action == "configure_database":
+            self.show_config()
+        elif action == "open_data_folder":
+            os.startfile(str(APP_DIR))
 
     def show_config(self):
         if self.config_window and self.config_window.winfo_exists():
@@ -174,6 +300,9 @@ class PrintTrackerApp:
 
         config = self.get_config()
         fields = {}
+        activity_interval = tk.StringVar(
+            master=window, value=str(config.get("activity_interval_minutes", 10))
+        )
         field_specs = (
             ("Host", "host", ""),
             ("Port", "port", ""),
@@ -188,25 +317,40 @@ class PrintTrackerApp:
             entry.grid(row=row, column=1, sticky="ew", pady=4)
             fields[key] = entry
 
+        ttk.Label(frame, text="Record activity totals every").grid(
+            row=6, column=0, sticky="w", pady=(10, 0)
+        )
+        ttk.Combobox(
+            frame,
+            textvariable=activity_interval,
+            values=tuple(str(interval) for interval in ACTIVITY_INTERVALS),
+            state="readonly",
+            width=5,
+        ).grid(row=6, column=1, sticky="w", pady=(10, 0))
         ttk.Label(
             frame,
-            text="Starts automatically when this Windows account signs in.",
+            text="Stores interval totals locally only; key values and pointer positions are not saved.",
             foreground="#555555",
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 10))
+            wraplength=360,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 10))
 
         connection_status = tk.StringVar(master=window)
         ttk.Label(frame, textvariable=connection_status).grid(
-            row=7, column=0, columnspan=2, sticky="w", pady=(0, 8)
+            row=8, column=0, columnspan=2, sticky="w", pady=(0, 8)
         )
         buttons = ttk.Frame(frame)
-        buttons.grid(row=8, column=0, columnspan=2, sticky="ew")
+        buttons.grid(row=9, column=0, columnspan=2, sticky="ew")
         ttk.Button(
             buttons,
             text="Test connection",
             command=lambda: self.test_connection(fields, connection_status, window),
         ).pack(side="left")
         ttk.Button(buttons, text="Cancel", command=window.destroy).pack(side="right", padx=(8, 0))
-        ttk.Button(buttons, text="Save", command=lambda: self.save_from_form(fields, window)).pack(side="right")
+        ttk.Button(
+            buttons,
+            text="Save",
+            command=lambda: self.save_from_form(fields, activity_interval, window),
+        ).pack(side="right")
         ttk.Label(
             frame,
             text="© 2026 Korbiz Solutions. Designed to support secure, scalable IT operations.",
@@ -214,7 +358,12 @@ class PrintTrackerApp:
             font=("Segoe UI", 8),
             wraplength=360,
             justify="left",
-        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Label(
+            frame,
+            text="Starts automatically when this Windows account signs in.",
+            foreground="#555555",
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         fields["host"].focus_set()
 
@@ -251,6 +400,7 @@ class PrintTrackerApp:
                     database=config["database"],
                     port=config["port"],
                     connect_timeout=5,
+                    use_pure=True,
                 )
                 result = "Connection successful." if connection.is_connected() else "Connection failed."
             except Error as error:
@@ -267,9 +417,22 @@ class PrintTrackerApp:
 
         threading.Thread(target=check_connection, daemon=True).start()
 
-    def save_from_form(self, fields, window):
-        config = self.config_from_form(fields, window)
-        if config is None:
+    def save_from_form(self, fields, activity_interval, window):
+        form_config = self.config_from_form(fields, window)
+        if form_config is None:
+            return
+        config = self.get_config()
+        config.update(form_config)
+        try:
+            config["activity_interval_minutes"] = int(activity_interval.get())
+        except ValueError:
+            config["activity_interval_minutes"] = 0
+        if config["activity_interval_minutes"] not in ACTIVITY_INTERVALS:
+            messagebox.showerror(
+                "Invalid activity interval",
+                "Choose an activity interval between 10 and 60 minutes.",
+                parent=window,
+            )
             return
 
         try:
@@ -278,22 +441,52 @@ class PrintTrackerApp:
             messagebox.showerror("Could not save settings", str(error), parent=window)
             return
 
+        self.configure_activity_monitor(config["activity_interval_minutes"])
         self.set_status("Monitoring")
         messagebox.showinfo("Settings saved", "Database settings were saved.", parent=window)
         window.destroy()
 
     def run(self):
+        self.root.after(0, self.process_ui_commands)
         self.icon.run_detached()
+        config = self.get_config()
+        self.configure_activity_monitor(config.get("activity_interval_minutes", 10))
         self.worker.start()
         if not self.config["host"]:
-            self.root.after(400, self.show_config)
-        self.root.mainloop()
+            self.root.after(400, lambda: self.authorize_tray_action("configure_database"))
+        try:
+            self.root.mainloop()
+        except KeyboardInterrupt:
+            self.shutdown()
+
+    def shutdown(self):
+        self.stop_event.set()
+        for listener in self.activity_listeners:
+            listener.stop()
+        for listener in self.activity_listeners:
+            listener.join(timeout=1)
+        self.activity_listeners = []
+
+        if self.worker.is_alive():
+            self.worker.join(timeout=6)
+
+        try:
+            self.flush_activity_counts(force=True)
+        except Exception as error:
+            write_log(f"Could not save activity totals during shutdown: {error}")
+
+        self.icon.stop()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def monitor_print_jobs(self):
         seen_jobs = set()
         while not self.stop_event.is_set():
             try:
                 self.process_print_jobs(seen_jobs)
+                self.flush_activity_counts()
                 self.sync_to_mysql()
                 if not self.get_config()["host"]:
                     self.set_status("Monitoring; database not configured")
@@ -303,6 +496,149 @@ class PrintTrackerApp:
                 self.set_status("An error occurred; see the log")
                 write_log(f"Tracker error: {error}")
             self.stop_event.wait(3)
+
+    def record_activity(self, count_name):
+        moment = datetime.datetime.now()
+        with self.activity_lock:
+            period_start = activity_period_start(moment, self.activity_interval_minutes)
+            counts = self.activity_counts.setdefault(
+                period_start,
+                {"mouse_movement_count": 0, "keyboard_stroke_count": 0},
+            )
+            counts[count_name] += 1
+
+    def record_mouse_activity(self, _x, _y):
+        self.record_activity("mouse_movement_count")
+
+    def record_keyboard_activity(self, _key):
+        self.record_activity("keyboard_stroke_count")
+
+    def configure_activity_monitor(self, interval_minutes):
+        if interval_minutes != self.activity_interval_minutes:
+            flushed_at = datetime.datetime.now()
+            with self.activity_lock:
+                previous_interval = self.activity_interval_minutes
+                self.write_activity_records(self.activity_counts, previous_interval, flushed_at)
+                self.activity_counts = {}
+                self.activity_interval_minutes = interval_minutes
+
+        if not self.activity_listeners:
+            try:
+                self.activity_listeners = [
+                    mouse.Listener(on_move=self.record_mouse_activity),
+                    keyboard.Listener(on_press=self.record_keyboard_activity),
+                ]
+                for listener in self.activity_listeners:
+                    listener.start()
+            except Exception as error:
+                for listener in self.activity_listeners:
+                    listener.stop()
+                self.activity_listeners = []
+                write_log(f"Could not start activity monitoring: {error}")
+                self.set_status("Activity monitoring could not start; see the log")
+    def flush_activity_counts(self, force=False):
+        now = datetime.datetime.now()
+        with self.activity_lock:
+            interval_minutes = self.activity_interval_minutes
+            current_period = activity_period_start(now, interval_minutes)
+            pending_counts = {
+                period_start: self.activity_counts[period_start]
+                for period_start in tuple(self.activity_counts)
+                if force or period_start < current_period
+            }
+            self.write_activity_records(pending_counts, interval_minutes, now)
+            for period_start in pending_counts:
+                del self.activity_counts[period_start]
+
+    def write_activity_records(self, counts_by_period, interval_minutes, flushed_at):
+        if not counts_by_period:
+            return
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        activity_queue = self.read_activity_queue()
+        records = []
+        for period_start, counts in sorted(counts_by_period.items()):
+            period_end = min(
+                period_start + datetime.timedelta(minutes=interval_minutes), flushed_at
+            )
+            record = {
+                "interval_start": period_start.isoformat(),
+                "interval_end": period_end.isoformat(),
+                "interval_minutes": interval_minutes,
+                **counts,
+            }
+            records.append(record)
+            activity_queue.append(
+                {
+                    "hostname": socket.gethostname(),
+                    **record,
+                    "synced": False,
+                }
+            )
+        self.write_activity_queue(activity_queue)
+        with ACTIVITY_FILE.open("a", encoding="utf-8") as activity_file:
+            for record in records:
+                activity_file.write(json.dumps(record) + "\n")
+
+    def initialize_activity_queue(self):
+        if ACTIVITY_QUEUE_FILE.exists():
+            return
+
+        activity_queue = []
+        try:
+            with ACTIVITY_FILE.open("r", encoding="utf-8") as activity_file:
+                for line in activity_file:
+                    saved_record = json.loads(line)
+                    interval_start = datetime.datetime.fromisoformat(
+                        saved_record.get("interval_start", saved_record.get("minute"))
+                    )
+                    interval_minutes = int(saved_record.get("interval_minutes", 1))
+                    interval_end = saved_record.get("interval_end")
+                    if interval_end is None:
+                        interval_end = min(
+                            interval_start + datetime.timedelta(minutes=interval_minutes),
+                            datetime.datetime.now(),
+                        ).isoformat()
+                    activity_queue.append(
+                        {
+                            "hostname": socket.gethostname(),
+                            "interval_start": interval_start.isoformat(),
+                            "interval_end": interval_end,
+                            "interval_minutes": interval_minutes,
+                            "mouse_movement_count": int(
+                                saved_record.get(
+                                    "mouse_movement_count", saved_record.get("mouse_movements", 0)
+                                )
+                            ),
+                            "keyboard_stroke_count": int(
+                                saved_record.get(
+                                    "keyboard_stroke_count", saved_record.get("keyboard_presses", 0)
+                                )
+                            ),
+                            "synced": False,
+                        }
+                    )
+        except FileNotFoundError:
+            pass
+        except (ValueError, TypeError, json.JSONDecodeError) as error:
+            write_log(f"Could not migrate activity log: {error}")
+
+        self.write_activity_queue(activity_queue)
+
+    def read_activity_queue(self):
+        try:
+            with ACTIVITY_QUEUE_FILE.open("r", encoding="utf-8") as activity_queue_file:
+                return json.load(activity_queue_file)
+        except FileNotFoundError:
+            return []
+        except Exception as error:
+            write_log(f"Could not read activity queue: {error}")
+            return []
+
+    def write_activity_queue(self, data):
+        temporary_file = ACTIVITY_QUEUE_FILE.with_suffix(".tmp")
+        with temporary_file.open("w", encoding="utf-8") as activity_queue_file:
+            json.dump(data, activity_queue_file, indent=2)
+        os.replace(temporary_file, ACTIVITY_QUEUE_FILE)
 
     def read_queue(self):
         try:
@@ -361,6 +697,19 @@ class PrintTrackerApp:
                 if printer_handle:
                     win32print.ClosePrinter(printer_handle)
 
+    def get_device_id(self, cursor, hostname, device_ids):
+        if hostname not in device_ids:
+            cursor.execute(
+                """
+                INSERT INTO devices (hostname)
+                VALUES (%s)
+                ON DUPLICATE KEY UPDATE device_id = LAST_INSERT_ID(device_id)
+                """,
+                (hostname,),
+            )
+            device_ids[hostname] = cursor.lastrowid
+        return device_ids[hostname]
+
     def sync_to_mysql(self):
         config = self.get_config()
         if not config["host"] or not config["user"] or not config["database"]:
@@ -369,7 +718,9 @@ class PrintTrackerApp:
 
         queue = self.read_queue()
         unsynced = [item for item in queue if not item.get("synced", False)]
-        if not unsynced:
+        activity_queue = self.read_activity_queue()
+        unsynced_activity = [item for item in activity_queue if not item.get("synced", False)]
+        if not unsynced and not unsynced_activity:
             return
 
         connection = None
@@ -382,30 +733,64 @@ class PrintTrackerApp:
                 database=config["database"],
                 port=config["port"],
                 connect_timeout=5,
+                use_pure=True,
             )
             cursor = connection.cursor()
+            device_ids = {}
             insert_query = """
-                INSERT INTO print_logs (hostname, document_name, copies, total_pages, print_timestamp)
+                INSERT INTO print_logs (device_id, document_name, copies, total_pages, print_timestamp)
                 VALUES (%s, %s, %s, %s, %s)
             """
             for item in unsynced:
+                device_id = self.get_device_id(cursor, item["hostname"], device_ids)
                 cursor.execute(
                     insert_query,
                     (
-                        item["hostname"],
+                        device_id,
                         item["document_name"],
                         item["copies"],
                         item["total_pages"],
                         item["timestamp"],
                     ),
                 )
+            activity_insert_query = """
+                INSERT INTO activity_logs (
+                    device_id,
+                    interval_start,
+                    interval_end,
+                    interval_minutes,
+                    mouse_movement_count,
+                    keyboard_stroke_count
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    interval_end = VALUES(interval_end),
+                    mouse_movement_count = VALUES(mouse_movement_count),
+                    keyboard_stroke_count = VALUES(keyboard_stroke_count)
+            """
+            for item in unsynced_activity:
+                device_id = self.get_device_id(cursor, item["hostname"], device_ids)
+                cursor.execute(
+                    activity_insert_query,
+                    (
+                        device_id,
+                        datetime.datetime.fromisoformat(item["interval_start"]),
+                        datetime.datetime.fromisoformat(item["interval_end"]),
+                        item["interval_minutes"],
+                        item["mouse_movement_count"],
+                        item["keyboard_stroke_count"],
+                    ),
+                )
             connection.commit()
             for item in unsynced:
                 item["synced"] = True
             self.write_queue(queue)
+            for item in unsynced_activity:
+                item["synced"] = True
+            self.write_activity_queue(activity_queue)
             self.set_status("Monitoring; database connected")
         except Error as error:
-            self.set_status("Database unavailable; jobs are queued")
+            self.set_status("Database unavailable; records are queued")
             write_log(f"Database sync failed: {error}")
         finally:
             if cursor:

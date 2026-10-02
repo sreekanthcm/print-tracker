@@ -15,3 +15,5 @@ print_tracker.log
 *.p12
 *.pem
 *.key
+/dashboard/config.local.php
+/dashboard/node_modules/
